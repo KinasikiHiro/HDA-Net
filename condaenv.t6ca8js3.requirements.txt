@@ -1,0 +1,16 @@
+torch>=2.0.0
+torchvision
+monai
+numpy
+scipy
+SimpleITK
+nibabel
+pydicom
+medpy
+scikit-image
+albumentations
+tqdm
+matplotlib
+opencv-python
+wandb
+pytorch-lightning
