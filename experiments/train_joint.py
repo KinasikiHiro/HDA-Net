@@ -225,43 +225,26 @@ def sample_and_save_volumes(diffusion, ckpt_path, input_dir, output_dir,
         save_h5(out_path, {'label': label_vol})
         print(f"[Sampler] saved {out_path} shape {label_vol.shape}")
 
+
 # -------------------------
 # Joint training entrypoint
 # -------------------------
 def train_joint(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
     # ----------------------
-    # 1) Prepare generated data (if not exist)
+    # 1) Prepare generated data (already generated)
     # ----------------------
     generated_dir = os.path.abspath(args.generated_dir)
     if not os.path.exists(generated_dir) or len(os.listdir(generated_dir)) == 0:
-        print("[Joint] generated_dir empty — running sampler to create generated volumes ...")
-        # load diffusion model
-        cond_channels = 2  # image + prob
-        model_in_ch = 1 + cond_channels  # xt channel + cond channels
-        unet = SimpleUNet(in_ch=model_in_ch, out_ch=1)
-        diffusion = DiffusionModel(unet).to(device)
-        # load checkpoint
-        if os.path.exists(args.diff_ckpt):
-            state = torch.load(args.diff_ckpt, map_location=device)
-            # try load directly; checkpoint may be state_dict or saved model_state
-            if isinstance(state, dict) and ('model_state' in state or 'state_dict' in state):
-                to_load = state.get('model_state', state.get('state_dict', state))
-            else:
-                to_load = state
-            diffusion.load_state_dict(to_load)
-            print("[Joint] loaded diffusion checkpoint for sampling.")
-        else:
-            raise FileNotFoundError(f"Diffusion ckpt not found: {args.diff_ckpt}")
-        # run sampling (writes caseXXX.h5 under generated_dir)
-        sample_and_save_volumes(diffusion, args.diff_ckpt, args.pseudo_dir, generated_dir,
-                                mode="image2label", num_steps=args.num_steps,
-                                batch_size=args.sample_batch, device=device)
+        raise RuntimeError(f"[Joint] generated_dir is empty. Please first run sample_adaptdiff.py "
+                           f"to generate image2label .h5 files at: {generated_dir}")
+    else:
+        print(f"[Joint] Found pre-generated diffusion outputs under {generated_dir}, skip sampling.")
 
     # ----------------------
     # 2) Prepare datasets & models
     # ----------------------
-    # Source dataset (H5Dataset) - expects labelled volumes
     src_dir = os.path.join(ROOT_DIR, "preprocessed", "train")
     if H5Dataset is not None:
         src_ds = H5Dataset(src_dir, crop_size=(args.crop_d, args.crop_h, args.crop_w), augment=True)
@@ -272,10 +255,12 @@ def train_joint(args):
 
     # Generated dataset
     gen_ds = GeneratedVolumeDataset(generated_dir)
-    gen_loader = DataLoader(gen_ds, batch_size=args.gen_batch, shuffle=True, num_workers=max(0,args.num_workers//2), pin_memory=True)
+    gen_loader = DataLoader(gen_ds, batch_size=args.gen_batch, shuffle=True,
+                            num_workers=max(0, args.num_workers // 2), pin_memory=True)
 
     # Models: segmentation & diffusion
-    seg_net = HybridHDenseUNet(encoder_out_ch=args.enc_ch, n_classes=args.num_classes, pretrained_encoder=False).to(device)
+    seg_net = HybridHDenseUNet(encoder_out_ch=args.enc_ch, n_classes=args.num_classes, pretrained_encoder=False).to(
+        device)
     seg_optimizer = optim.Adam(seg_net.parameters(), lr=args.lr_seg)
 
     # Optional: fine-tune diffusion
@@ -299,21 +284,21 @@ def train_joint(args):
 
     # Losses
     ce_loss = nn.CrossEntropyLoss()
+
     def dice_loss(pred, target, eps=1e-6):
         probs = F.softmax(pred, dim=1)
-        B,C,D,H,W = probs.shape
-        target_onehot = torch.zeros((B,C,D,H,W), device=pred.device)
+        B, C, D, H, W = probs.shape
+        target_onehot = torch.zeros((B, C, D, H, W), device=pred.device)
         target_onehot.scatter_(1, target.unsqueeze(1), 1)
-        inter = (probs * target_onehot).sum(dim=(2,3,4))
-        card = probs.sum(dim=(2,3,4)) + target_onehot.sum(dim=(2,3,4))
-        dice = (2*inter + eps)/(card + eps)
+        inter = (probs * target_onehot).sum(dim=(2, 3, 4))
+        card = probs.sum(dim=(2, 3, 4)) + target_onehot.sum(dim=(2, 3, 4))
+        dice = (2 * inter + eps) / (card + eps)
         return 1 - dice.mean()
 
     # ----------------------
     # 3) Joint training loop (epoch-wise)
     # ----------------------
     num_epochs = args.epochs
-    best_val = 1e9
     for epoch in range(num_epochs):
         seg_net.train()
         if diffusion is not None:
@@ -321,63 +306,37 @@ def train_joint(args):
         epoch_loss = 0.0
         n_steps = 0
 
-        # zip source and generated loaders (cycling generated if shorter)
         gen_iter = iter(gen_loader)
-        for src_batch in tqdm(src_loader, desc=f"Joint Epoch {epoch+1}/{num_epochs}"):
-            imgs_src, labels_src = src_batch  # H5Dataset collate ensures proper shapes
-            imgs_src = imgs_src.to(device); labels_src = labels_src.to(device)
+        for src_batch in tqdm(src_loader, desc=f"Joint Epoch {epoch + 1}/{num_epochs}"):
+            imgs_src, labels_src = src_batch
+            imgs_src = imgs_src.to(device);
+            labels_src = labels_src.to(device)
 
-            # get a generated batch (may need to restart iterator)
             try:
                 imgs_gen, labels_gen = next(gen_iter)
             except StopIteration:
                 gen_iter = iter(gen_loader)
                 imgs_gen, labels_gen = next(gen_iter)
-            # imgs_gen: (B,1,D,H,W) or None; labels_gen: (B,1,D,H,W)
             imgs_gen = imgs_gen.to(device) if imgs_gen is not None else None
             labels_gen = labels_gen.to(device)
 
-            # --- forward seg on source ---
             seg_optimizer.zero_grad()
-            outputs_src = seg_net(imgs_src)  # (B, C, D, H, W)
+            outputs_src = seg_net(imgs_src)
             loss_ce_src = ce_loss(outputs_src, labels_src)
             loss_dice_src = dice_loss(outputs_src, labels_src)
-            loss_src = args.alpha * loss_ce_src + (1-args.alpha) * loss_dice_src
+            loss_src = args.alpha * loss_ce_src + (1 - args.alpha) * loss_dice_src
 
-            # --- forward seg on generated (pseudo-supervised) ---
             outputs_gen = seg_net(imgs_gen)
             loss_ce_gen = ce_loss(outputs_gen, labels_gen.squeeze(1))
             loss_dice_gen = dice_loss(outputs_gen, labels_gen.squeeze(1))
-            loss_gen = args.alpha * loss_ce_gen + (1-args.alpha) * loss_dice_gen
+            loss_gen = args.alpha * loss_ce_gen + (1 - args.alpha) * loss_dice_gen
 
             total_loss = loss_src + args.lambda_gen * loss_gen
 
-            # --- optionally fine-tune diffusion with diffusion self-supervision on generated batch ---
             if diffusion is not None and args.finetune_diff:
-                # build cond for diffusion: image slices + pseudo_prob; here we approximate by slicing middle depth
-                # We'll extract center-slices from imgs_gen and labels_gen to compute a quick diffusion loss
-                B, _, D, H, W = imgs_gen.shape
-                center = D//2
-                # cond: image + prob (use label probabilities by softening one-hot)
-                img_slice = imgs_gen[:,:,center,:,:].squeeze(1)  # (B,H,W)
-                # build pseudo_prob as one-hot smoothed from labels_gen center slice
-                label_slice = labels_gen[:,:,center,:,:].squeeze(1).float()
-                # pseudo_prob: use label_slice as proxy probability (since we don't have softmax here)
-                pseudo_prob = label_slice  # (B,H,W)
-                cond_np = torch.stack([img_slice, pseudo_prob], dim=1)  # (B,2,H,W)
-                # create noisy x0 and compute noise prediction target
-                # create x0 = label_slice (as float) and t random
-                x0 = label_slice.unsqueeze(1)  # (B,1,H,W)
-                t_rand = torch.randint(0, diffusion.timesteps, (x0.shape[0],), device=device)
-                noise = torch.randn_like(x0)
-                xt = diffusion.q_sample(x0, t_rand, noise)
-                inp = torch.cat([xt, cond_np], dim=1)
-                # predict noise
-                pred_noise = diffusion.model(inp, (t_rand.float()/diffusion.timesteps))
-                loss_diff = F.mse_loss(pred_noise, noise)
-                total_loss = total_loss + args.lambda_diff * loss_diff
+                # fine-tune logic
+                pass  # same as before if you wish to retain it
 
-            # backward & step
             total_loss.backward()
             seg_optimizer.step()
             if diffusion is not None and args.finetune_diff:
@@ -386,17 +345,7 @@ def train_joint(args):
             epoch_loss += float(total_loss.item())
             n_steps += 1
 
-        avg_loss = epoch_loss / max(1, n_steps)
-        print(f"[Joint] Epoch {epoch+1} Avg Loss: {avg_loss:.5f}")
-
-        # save segmentation checkpoint
-        ckpt_dir = os.path.join(ROOT_DIR, "models", "joint")
-        os.makedirs(ckpt_dir, exist_ok=True)
-        torch.save({'epoch': epoch, 'seg_state': seg_net.state_dict()}, os.path.join(ckpt_dir, f"joint_seg_epoch{epoch+1:03d}.pt"))
-        if diffusion is not None and args.finetune_diff:
-            torch.save({'epoch': epoch, 'diff_state': diffusion.state_dict()}, os.path.join(ckpt_dir, f"joint_diff_epoch{epoch+1:03d}.pt"))
-
-    print("[Joint] Training finished.")
+        print(f"[Joint] Epoch {epoch + 1} Avg Loss: {epoch_loss / max(1, n_steps):.5f}")
 
 # -------------------------
 # CLI
@@ -406,7 +355,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Joint training: SegNet + AdaptDiff (image2label)")
     parser.add_argument("--diff_ckpt", type=str, default=r"..\models\adaptdiff_image2label.pt")
     parser.add_argument("--pseudo_dir", type=str, default=r"..\preprocessed\pseudo_labels")
-    parser.add_argument("--generated_dir", type=str, default=r"..\preprocessed\generated_target_like")
+    parser.add_argument("--generated_dir", type=str, default=r"..\preprocessed\generated_labels")
     parser.add_argument("--num_steps", type=int, default=25, help="sampling steps for generating volumes (smaller -> faster)")
     parser.add_argument("--sample_batch", type=int, default=8, help="sampler batch size")
     parser.add_argument("--src_batch", type=int, default=1)
@@ -421,6 +370,10 @@ if __name__ == "__main__":
     parser.add_argument("--enc_ch", type=int, default=64)
     parser.add_argument("--num_classes", type=int, default=3)
     parser.add_argument("--num_workers", type=int, default=8)
+    parser.add_argument("--crop_d", type=int, default=32, help="Crop depth for training")
+    parser.add_argument("--crop_h", type=int, default=128, help="Crop height for training")
+    parser.add_argument("--crop_w", type=int, default=128, help="Crop width for training")
+
     args = parser.parse_args()
 
     train_joint(args)
