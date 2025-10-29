@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# IDE
+.idea/
+.vscode/
+
+# 数据 / 模型 / 大文件
+*.h5
+*.pt
+*.npy
+*.nii
+*.zip
+*.tar.gz
+data/
+outputs/
