@@ -1,0 +1,12 @@
+==== Evaluation Summary ====
+Source-only Dice: 0.8333
+Joint-adapted Dice: 0.8333
+DGRR: 0.0000
+dice         src=0.8333, joint=0.8333
+iou          src=0.8333, joint=0.8333
+precision    src=1.0000, joint=1.0000
+recall       src=0.8333, joint=0.8333
+vol_diff     src=0.1667, joint=0.1667
+conf_mean    src=0.9910, joint=0.9569
+conf_ratio   src=0.9978, joint=0.9936
+============================
