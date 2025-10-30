@@ -1,0 +1,12 @@
+==== Label Comparison Summary ====
+dice_Liver     : 0.5255
+iou_Liver      : 0.3667
+precision_Liver: 0.7315
+recall_Liver   : 0.4333
+vol_diff_Liver : 0.4104
+dice_Tumor     : 0.1613
+iou_Tumor      : 0.1613
+precision_Tumor: 1.0000
+recall_Tumor   : 0.1613
+vol_diff_Tumor : 0.8387
+===============================

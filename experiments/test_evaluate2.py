@@ -43,10 +43,13 @@ class TestH5Dataset:
         file = self.files[idx]
         with h5py.File(file, "r") as f:
             img = f["image"][()]  # (H, W, D)
-            label = f["label"][()]  # (H, W, D)
+            label = f["label"][()] if "label" in f else np.zeros_like(img, dtype=np.uint8)
         img = (img - img.min()) / (img.max() - img.min() + 1e-8)
+        # ✅ 关键修改：transpose label -> (D,H,W) 与模型输出对齐
+        label = label.transpose(2,0,1)
         case_id = os.path.splitext(os.path.basename(file))[0]
-        return torch.from_numpy(img[None, None]).float(), torch.from_numpy(label).long(), case_id  # (1,1,H,W,D), (H,W,D)
+        # 返回 (B=1,C=1,D,H,W)
+        return torch.from_numpy(img[None,None]).float(), torch.from_numpy(label).long(), case_id
 
 # ----------------------
 # Patch inference
@@ -65,10 +68,10 @@ def sliding_window_inference(model, volume, patch_size, overlap=0.25):
         for z in range(0, D - patch_size[0] + 1, stride_d):
             for y in range(0, H - patch_size[1] + 1, stride_h):
                 for x in range(0, W - patch_size[2] + 1, stride_w):
-                    patch = volume[:, :, z:z + patch_size[0], y:y + patch_size[1], x:x + patch_size[2]]
+                    patch = volume[:, :, z:z+patch_size[0], y:y+patch_size[1], x:x+patch_size[2]]
                     out_patch = model(patch)
-                    output[:, :, z:z + patch_size[0], y:y + patch_size[1], x:x + patch_size[2]] += out_patch
-                    counts[:, :, z:z + patch_size[0], y:y + patch_size[1], x:x + patch_size[2]] += 1
+                    output[:, :, z:z+patch_size[0], y:y+patch_size[1], x:x+patch_size[2]] += out_patch
+                    counts[:, :, z:z+patch_size[0], y:y+patch_size[1], x:x+patch_size[2]] += 1
 
         output /= counts
     return output
@@ -76,16 +79,15 @@ def sliding_window_inference(model, volume, patch_size, overlap=0.25):
 # ----------------------
 # Evaluation
 # ----------------------
-def evaluate_model(model, dataset, device, patch_size=(16, 128, 128)):
+def evaluate_model(model, dataset, device, patch_size=(16,128,128)):
     model.eval()
     results = []
 
     with torch.no_grad():
         for img_t, label_t, case_id in tqdm(dataset, desc="Evaluating"):
             torch.cuda.empty_cache()
-
-            img_t = img_t.to(device, non_blocking=True)
-            label_t = label_t.numpy()
+            img_t = img_t.to(device, non_blocking=True)  # (1,1,D,H,W)
+            label_t = label_t.numpy()  # (D,H,W)
 
             try:
                 with torch.amp.autocast('cuda'):
@@ -93,20 +95,20 @@ def evaluate_model(model, dataset, device, patch_size=(16, 128, 128)):
                         out = sliding_window_inference(model, img_t, patch_size)
                     else:
                         out = model(img_t)
-
-                pred = torch.argmax(out, dim=1).cpu().numpy()[0]
+                # ✅ 关键修改：确保 pred shape == label shape
+                pred = torch.argmax(out, dim=1).cpu().numpy()[0]  # (D,H,W)
             except RuntimeError as e:
                 if "CUDA out of memory" in str(e):
                     print(f"[WARN] OOM on {case_id}, retrying with smaller patch size...")
                     torch.cuda.empty_cache()
                     with torch.amp.autocast('cuda'):
-                        out = sliding_window_inference(model, img_t, (8, 96, 96))
+                        out = sliding_window_inference(model, img_t, (8,96,96))
                     pred = torch.argmax(out, dim=1).cpu().numpy()[0]
                 else:
                     raise e
 
             metrics = {}
-            for cls in range(1, 3):  # liver/tumor classes
+            for cls in range(1, 3):  # liver/tumor
                 p = (pred == cls).astype(np.float32)
                 t = (label_t == cls).astype(np.float32)
                 metrics[f"dice_cls{cls}"] = dice(p, t)
@@ -123,94 +125,60 @@ def evaluate_model(model, dataset, device, patch_size=(16, 128, 128)):
     return results
 
 # ----------------------
-# Visualization
-# ----------------------
-def plot_boxplot(results_a, results_b, out_dir, metrics=["dice_cls1","iou_cls1","precision_cls1","recall_cls1"]):
-    plt.figure(figsize=(10,5))
-    data_a = [[r[m] for r in results_a] for m in metrics]
-    data_b = [[r[m] for r in results_b] for m in metrics]
-    plt.boxplot(data_a, positions=np.arange(len(metrics))*2.0, widths=0.6, labels=metrics)
-    plt.boxplot(data_b, positions=np.arange(len(metrics))*2.0+0.8, widths=0.6)
-    plt.title("Baseline (blue) vs Joint (orange)")
-    plt.xticks(rotation=30)
-    plt.tight_layout()
-    plt.savefig(os.path.join(out_dir, "comparison_boxplot.png"), dpi=300)
-    plt.close()
-
-def plot_radar(avg_a, avg_b, out_dir):
-    labels = list(avg_a.keys())
-    n = len(labels)
-    angles = np.linspace(0, 2*pi, n, endpoint=False).tolist()
-    avg_a_vals = list(avg_a.values())
-    avg_b_vals = list(avg_b.values())
-    avg_a_vals += avg_a_vals[:1]
-    avg_b_vals += avg_b_vals[:1]
-    angles += angles[:1]
-    plt.figure(figsize=(6,6))
-    plt.polar(angles, avg_a_vals, label="Baseline", color="blue")
-    plt.polar(angles, avg_b_vals, label="Joint", color="orange")
-    plt.fill(angles, avg_a_vals, alpha=0.25, color="blue")
-    plt.fill(angles, avg_b_vals, alpha=0.25, color="orange")
-    plt.legend()
-    plt.savefig(os.path.join(out_dir, "comparison_radar.png"), dpi=300)
-    plt.close()
-
-# ----------------------
-# Main
+# Main: 和你原来的保持一致
 # ----------------------
 def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[Eval] Using device: {device}")
 
-    test_dir = os.path.join("..", "preprocessed", "test")
-    results_dir = os.path.join("..", "results", "joint_evaluate")
+    test_dir = os.path.join("..","preprocessed","test")
+    results_dir = os.path.join("..","results","joint_evaluate")
     os.makedirs(results_dir, exist_ok=True)
     dataset = TestH5Dataset(test_dir)
 
     # ---------------- Stage 1: baseline ----------------
     print("[Eval] Stage 1: Evaluating baseline model...")
     base_model = HybridHDenseUNet(encoder_out_ch=64, n_classes=3).to(device)
-    base_model.n_classes = 3  # ✅ 临时补上
+    base_model.n_classes = 3
     base_model.load_state_dict(
-        torch.load(os.path.join("..", "models", "best_h_denseunet_model.pt"), map_location=device, weights_only=True)
+        torch.load(os.path.join("..","models","best_h_denseunet_model.pt"), map_location=device, weights_only=True)
     )
-    base_results = evaluate_model(base_model, dataset, device, patch_size=(16, 128, 128))
+    base_results = evaluate_model(base_model, dataset, device, patch_size=(16,128,128))
     del base_model; torch.cuda.empty_cache()
 
     # ---------------- Stage 2: joint ----------------
     print("[Eval] Stage 2: Evaluating joint model...")
     joint_model = HybridHDenseUNet(encoder_out_ch=64, n_classes=3).to(device)
     joint_model.n_classes = 3
-    joint_ckpt = torch.load(os.path.join("..", "models", "joint_seg_best.pt"), map_location=device, weights_only=True)
+    joint_ckpt = torch.load(os.path.join("..","models","joint_seg_best.pt"), map_location=device, weights_only=True)
     joint_model.load_state_dict(joint_ckpt["model"] if "model" in joint_ckpt else joint_ckpt)
-    joint_results = evaluate_model(joint_model, dataset, device, patch_size=(16, 128, 128))
+    joint_results = evaluate_model(joint_model, dataset, device, patch_size=(16,128,128))
     del joint_model; torch.cuda.empty_cache()
 
-    # ---- Save metrics ----
-    csv_path = os.path.join(results_dir, "metrics.csv")
-    with open(csv_path, "w", newline="") as f:
+    # ---------------- Stage 3: save metrics ----------------
+    csv_path = os.path.join(results_dir,"metrics.csv")
+    with open(csv_path,"w",newline="") as f:
         writer = csv.writer(f)
-        keys = ["case"] + [k for k in base_results[0].keys() if k != "case"]
+        keys = ["case"] + [k for k in base_results[0].keys() if k!="case"]
         writer.writerow(["model"] + keys)
-        for br, jr in zip(base_results, joint_results):
+        for br,jr in zip(base_results, joint_results):
             writer.writerow(["baseline"] + [br[k] for k in keys])
             writer.writerow(["joint"] + [jr[k] for k in keys])
     print(f"[Eval] Metrics saved → {csv_path}")
 
-    # ---- Summary ----
+    # ---------------- Stage 4: summary ----------------
     def avg_std(results):
         out = {}
         for k in results[0].keys():
-            if k == "case": continue
+            if k=="case": continue
             vals = [r[k] for r in results]
             out[k] = np.mean(vals)
         return out
-
     avg_base = avg_std(base_results)
     avg_joint = avg_std(joint_results)
 
-    summary_txt = os.path.join(results_dir, "summary.txt")
-    with open(summary_txt, "w") as f:
+    summary_txt = os.path.join(results_dir,"summary.txt")
+    with open(summary_txt,"w") as f:
         f.write("==== Evaluation Summary ====\n")
         f.write(f"Source-only Dice: {avg_base['dice_cls1']:.4f}\n")
         f.write(f"Joint-adapted Dice: {avg_joint['dice_cls1']:.4f}\n")
@@ -221,11 +189,5 @@ def main():
         f.write("============================\n")
     print(f"[Eval] Summary saved → {summary_txt}")
 
-    # ---- Visualization ----
-    plot_boxplot(base_results, joint_results, results_dir)
-    plot_radar(avg_base, avg_joint, results_dir)
-
-    print("[Eval] All visualizations saved!")
-
-if __name__ == "__main__":
+if __name__=="__main__":
     main()

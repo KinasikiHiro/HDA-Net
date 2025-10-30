@@ -1,0 +1,16 @@
+==== Evaluation Summary ====
+Source-only Dice: 0.4848
+Joint-adapted Dice: 0.2305
+DGRR: -0.2543
+
+dice_cls1    src=0.4848, joint=0.2305
+iou_cls1     src=0.3293, joint=0.1463
+precision_cls1 src=0.7583, joint=0.6828
+recall_cls1  src=0.3794, joint=0.1707
+vol_diff_cls1 src=0.4876, joint=0.7481
+dice_cls2    src=0.1613, joint=0.0323
+iou_cls2     src=0.1613, joint=0.0323
+precision_cls2 src=1.0000, joint=0.5484
+recall_cls2  src=0.1613, joint=0.1613
+vol_diff_cls2 src=0.8387, joint=27677420.2024
+============================
