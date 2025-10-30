@@ -1,205 +1,193 @@
 import os
-os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
-
 import sys
 import csv
-from collections import defaultdict
-import h5py
-import numpy as np
 import torch
-import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
+import numpy as np
+import h5py
 from tqdm import tqdm
 import matplotlib.pyplot as plt
+from math import pi
 
-# ------------------------- Path setup -------------------------
+# ----------------------
+# Path setup
+# ----------------------
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 ROOT_DIR = os.path.abspath(os.path.join(CURRENT_DIR, ".."))
-sys.path.append(os.path.join(ROOT_DIR, "experiments"))
+UTILS_DIR = os.path.join(ROOT_DIR, "utils")
+if UTILS_DIR not in sys.path:
+    sys.path.append(UTILS_DIR)
+EXPERIMENTS_DIR = os.path.join(ROOT_DIR, "experiments")
+if EXPERIMENTS_DIR not in sys.path:
+    sys.path.append(EXPERIMENTS_DIR)
 
 from train_h_denseunet import HybridHDenseUNet
 
-# ------------------------- Dataset -------------------------
-class PseudoLabelVolumeDataset(Dataset):
-    """按 volume 读取 H5 文件，减少频繁 IO"""
-    def __init__(self, folder, case_name=None):
-        self.files = sorted([os.path.join(folder, f) for f in os.listdir(folder) if f.endswith(".h5")])
-        if case_name:
-            self.files = [f for f in self.files if case_name in f]
-        if len(self.files) == 0:
-            raise RuntimeError(f"[Dataset] No file matches case_name={case_name}")
-
-    def __len__(self):
-        return len(self.files)
-
-    def __getitem__(self, idx):
-        fpath = self.files[idx]
-        with h5py.File(fpath, 'r') as f:
-            img_vol = f['image'][()].astype(np.float32) if 'image' in f else np.zeros(f['label'].shape, dtype=np.float32)
-            label_vol = f['label'][()].astype(np.int16)
-        # 增加 channel 维度
-        img_vol = torch.from_numpy(img_vol).unsqueeze(0)  # [C,H,W] 或 [C,H,W,D]
-        label_vol = torch.from_numpy(label_vol).unsqueeze(0)  # [1,H,W] 或 [1,H,W,D]
-        return img_vol, label_vol, os.path.basename(fpath)
-
-# ------------------------- Metrics -------------------------
+# ----------------------
+# Metric functions
+# ----------------------
 EPS = 1e-6
-def dice(pred, target):
-    inter = (pred*target).sum()
-    return ((2*inter+EPS)/(pred.sum()+target.sum()+EPS)).item()
-def iou(pred, target):
-    inter = (pred*target).sum()
-    union = pred.sum()+target.sum()-inter
-    return ((inter+EPS)/(union+EPS)).item()
-def precision(pred, target):
-    tp = (pred*target).sum()
-    fp = (pred*(1-target)).sum()
-    return ((tp+EPS)/(tp+fp+EPS)).item()
-def recall(pred, target):
-    tp = (pred*target).sum()
-    fn = ((1-pred)*target).sum()
-    return ((tp+EPS)/(tp+fn+EPS)).item()
-def volume_diff(pred, target):
-    return abs(pred.sum().item() - target.sum().item()) / (target.sum().item()+EPS)
+def dice(pred, target): inter = (pred * target).sum(); return ((2 * inter + EPS) / (pred.sum() + target.sum() + EPS)).item()
+def iou(pred, target): inter = (pred * target).sum(); union = pred.sum() + target.sum() - inter; return ((inter + EPS) / (union + EPS)).item()
+def precision(pred, target): tp = (pred * target).sum(); fp = (pred * (1 - target)).sum(); return ((tp + EPS) / (tp + fp + EPS)).item()
+def recall(pred, target): tp = (pred * target).sum(); fn = ((1 - pred) * target).sum(); return ((tp + EPS) / (tp + fn + EPS)).item()
+def volume_diff(pred, target): return abs(pred.sum().item() - target.sum().item()) / (target.sum().item() + EPS)
 
-# ------------------------- Evaluate (volume-wise) -------------------------
-def evaluate_model_volume(model, dataset, device, n_classes=3, vis_dir=None):
+# ----------------------
+# Dataset loader (3D-based)
+# ----------------------
+class TestH5Dataset:
+    def __init__(self, folder):
+        self.files = sorted([os.path.join(folder, f) for f in os.listdir(folder) if f.endswith(".h5")])
+    def __len__(self): return len(self.files)
+    def __getitem__(self, idx):
+        with h5py.File(self.files[idx], "r") as f:
+            img = f["image"][()]  # (H, W, D)
+            label = f["label"][()]  # (H, W, D)
+        img = (img - img.min()) / (img.max() - img.min() + 1e-8)
+        img = np.expand_dims(img, axis=0)  # -> (1, H, W, D)
+        label = np.expand_dims(label, axis=0)
+        return img, label, os.path.basename(self.files[idx])
+
+# ----------------------
+# Evaluation (single model)
+# ----------------------
+def evaluate_model(model, dataset, device, num_classes=3):
     model.eval()
-    loader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=4, pin_memory=True)
-    per_volume_metrics = {}
-    conf_values_per_volume = {}
-
+    results = []
     with torch.no_grad():
-        for img_vol, label_vol, fname in tqdm(loader, desc="Evaluating (volume-wise)"):
-            img_vol = img_vol.to(device).float()
-            label_vol = label_vol.to(device).long()
+        for img, label, name in tqdm(dataset, desc="Evaluating"):
+            img_t = torch.from_numpy(img).unsqueeze(0).float().to(device)  # (B=1, C=1, H, W, D)
+            out = model(img_t)
+            pred = torch.argmax(out, dim=1).cpu().numpy()[0]
+            gt = label[0]
 
-            # 处理 2D/3D 数据
-            if img_vol.ndim == 4:  # [B,C,H,W] -> 3D, add depth
-                img_vol = img_vol.unsqueeze(2)  # [B,C,D,H,W]
-            elif img_vol.ndim == 5:
-                pass  # already 3D
-            else:
-                raise RuntimeError(f"Unexpected img_vol ndim: {img_vol.ndim}")
+            metrics = {}
+            for cls in range(1, num_classes):
+                p = (pred == cls).astype(np.float32)
+                t = (gt == cls).astype(np.float32)
+                metrics[f"dice_cls{cls}"] = dice(p, t)
+                metrics[f"iou_cls{cls}"] = iou(p, t)
+                metrics[f"precision_cls{cls}"] = precision(p, t)
+                metrics[f"recall_cls{cls}"] = recall(p, t)
+                metrics[f"vol_diff_cls{cls}"] = volume_diff(p, t)
+            results.append({"case": name, **metrics})
+    return results
 
-            # Forward
-            with torch.amp.autocast(device_type='cuda'):
-                out = model(img_vol)  # [B,C,D,H,W] 或 [B,C,H,W]
+# ----------------------
+# Visualization
+# ----------------------
+def plot_boxplot(results_a, results_b, out_dir, metrics=["dice_cls1","iou_cls1","precision_cls1","recall_cls1"]):
+    plt.figure(figsize=(10,5))
+    data_a = [[r[m] for r in results_a] for m in metrics]
+    data_b = [[r[m] for r in results_b] for m in metrics]
+    plt.boxplot(data_a, positions=np.arange(len(metrics))*2.0, widths=0.6, labels=metrics)
+    plt.boxplot(data_b, positions=np.arange(len(metrics))*2.0+0.8, widths=0.6)
+    plt.title("Baseline (blue) vs Joint (orange)")
+    plt.xticks(rotation=30)
+    plt.tight_layout()
+    plt.savefig(os.path.join(out_dir, "comparison_boxplot.png"), dpi=300)
+    plt.close()
 
-            # Resize to label size
-            out = F.interpolate(out, size=label_vol.shape[2:], mode='trilinear', align_corners=False)
+def plot_radar(avg_a, avg_b, out_dir):
+    labels = list(avg_a.keys())
+    n = len(labels)
+    angles = np.linspace(0, 2*pi, n, endpoint=False).tolist()
+    avg_a_vals = list(avg_a.values())
+    avg_b_vals = list(avg_b.values())
+    avg_a_vals += avg_a_vals[:1]
+    avg_b_vals += avg_b_vals[:1]
+    angles += angles[:1]
+    plt.figure(figsize=(6,6))
+    plt.polar(angles, avg_a_vals, label="Baseline", color="blue")
+    plt.polar(angles, avg_b_vals, label="Joint", color="orange")
+    plt.fill(angles, avg_a_vals, alpha=0.25, color="blue")
+    plt.fill(angles, avg_b_vals, alpha=0.25, color="orange")
+    plt.legend()
+    plt.savefig(os.path.join(out_dir, "comparison_radar.png"), dpi=300)
+    plt.close()
 
-            if n_classes == 1:
-                probs = torch.sigmoid(out)
-                pred = (probs>0.5).float()
-                conf_map = probs.cpu().squeeze().numpy()
-            else:
-                probs = F.softmax(out, dim=1)
-                pred_labels = probs.argmax(dim=1, keepdim=True)
-                conf_map, _ = probs.max(dim=1)
-                pred = (pred_labels>0).float()
-                conf_map = conf_map.cpu().squeeze().numpy()
+# ----------------------
+# Helper: Save & Load metrics
+# ----------------------
+def save_metrics_to_csv(results, csv_path, model_name):
+    with open(csv_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        keys = ["case"] + [k for k in results[0].keys() if k != "case"]
+        writer.writerow(["model"] + keys)
+        for r in results:
+            writer.writerow([model_name] + [r[k] for k in keys])
 
-            # Metrics
-            tgt_fg = (label_vol.cpu()>0).float()
-            pred_fg = pred.cpu()
+def load_csv_as_dict(csv_path):
+    with open(csv_path, "r") as f:
+        reader = csv.reader(f)
+        next(reader)
+        rows = list(reader)
+    results = []
+    for r in rows:
+        case_dict = {"case": r[1]}
+        for i, k in enumerate(rows[0][2:], start=2):
+            case_dict[k] = float(r[i])
+        results.append(case_dict)
+    return results
 
-            m = {
-                "dice": dice(pred_fg, tgt_fg),
-                "iou": iou(pred_fg, tgt_fg),
-                "precision": precision(pred_fg, tgt_fg),
-                "recall": recall(pred_fg, tgt_fg),
-                "vol_diff": volume_diff(pred_fg, tgt_fg),
-                "conf_mean": conf_map.mean(),
-                "conf_ratio": (conf_map>0.9).mean()
-            }
-
-            per_volume_metrics[fname[0]] = m
-            conf_values_per_volume[fname[0]] = conf_map
-
-            # Visualization (optional)
-            if vis_dir:
-                os.makedirs(vis_dir, exist_ok=True)
-                # 展示中间 slice
-                mid_slice = img_vol.shape[2]//2
-                fig, axs = plt.subplots(1,4,figsize=(14,4))
-                axs[0].imshow(img_vol.cpu().squeeze()[mid_slice], cmap='gray'); axs[0].set_title("Input")
-                axs[1].imshow(label_vol.cpu().squeeze(), cmap='gray'); axs[1].set_title("GT")
-                axs[2].imshow(pred.cpu().squeeze(), cmap='gray'); axs[2].set_title("Pred")
-                im = axs[3].imshow(conf_map[mid_slice], cmap='jet'); axs[3].set_title("Confidence")
-                for ax in axs: ax.axis('off')
-                fig.colorbar(im, ax=axs[3], fraction=0.046, pad=0.02)
-                plt.tight_layout()
-                plt.savefig(os.path.join(vis_dir,f"{fname[0]}_vis.png"))
-                plt.close()
-
-    # Overall metrics
-    overall_agg = {k: np.mean([m[k] for m in per_volume_metrics.values()]) for k in m.keys()}
-
-    return overall_agg, per_volume_metrics, conf_values_per_volume
-
-# ------------------------- Main -------------------------
+# ----------------------
+# Main
+# ----------------------
 def main():
-    import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--src_model", type=str, default=os.path.join("..", "models", "best_h_denseunet_model.pt"))
-    parser.add_argument("--joint_model", type=str, default=os.path.join("..", "models", "joint_seg_best.pt"))
-    parser.add_argument("--pseudo_dir", type=str, default=os.path.join("..", "preprocessed", "pseudo_labels"))
-    parser.add_argument("--result_dir", type=str, default=os.path.join("..", "results", "joint_evaluate"))
-    parser.add_argument("--case_name", type=str, default="case_001.h5")
-    parser.add_argument("--n_classes", type=int, default=3)
-    parser.add_argument("--device", type=str, default=None)
-    parser.add_argument("--vis_dir", type=str, default=None)
-    args = parser.parse_args()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"[Eval] Using device: {device}")
 
-    device = torch.device(args.device if args.device else ("cuda" if torch.cuda.is_available() else "cpu"))
-    os.makedirs(args.result_dir, exist_ok=True)
+    test_dir = os.path.join("..", "preprocessed", "test")
+    results_dir = os.path.join("..", "results", "joint_evaluate")
+    os.makedirs(results_dir, exist_ok=True)
+    dataset = TestH5Dataset(test_dir)
 
-    dataset = PseudoLabelVolumeDataset(args.pseudo_dir, case_name=args.case_name)
+    # ---- 1️⃣ Baseline Evaluation ----
+    print("[Eval] Stage 1: Evaluating baseline model...")
+    base_model = HybridHDenseUNet(encoder_out_ch=64, n_classes=3).to(device)
+    base_model.load_state_dict(torch.load(os.path.join("..","models","best_h_denseunet_model.pt"), map_location=device, weights_only=True))
+    base_results = evaluate_model(base_model, dataset, device)
+    save_metrics_to_csv(base_results, os.path.join(results_dir, "baseline_metrics.csv"), "baseline")
+    del base_model
+    torch.cuda.empty_cache()
 
-    model_src = HybridHDenseUNet(n_classes=args.n_classes).to(device)
-    model_joint = HybridHDenseUNet(n_classes=args.n_classes).to(device)
+    # ---- 2️⃣ Joint Evaluation ----
+    print("[Eval] Stage 2: Evaluating joint model...")
+    joint_model = HybridHDenseUNet(encoder_out_ch=64, n_classes=3).to(device)
+    joint_ckpt = torch.load(os.path.join("..","models","joint_seg_best.pt"), map_location=device, weights_only=True)
+    joint_model.load_state_dict(joint_ckpt["model"] if "model" in joint_ckpt else joint_ckpt)
+    joint_results = evaluate_model(joint_model, dataset, device)
+    save_metrics_to_csv(joint_results, os.path.join(results_dir, "joint_metrics.csv"), "joint")
+    del joint_model
+    torch.cuda.empty_cache()
 
-    state_src = torch.load(args.src_model, map_location=device)
-    model_src.load_state_dict(state_src if isinstance(state_src, dict) else state_src)
+    # ---- 3️⃣ Summary & Visualization ----
+    def avg_std(results):
+        out = {}
+        for k in results[0].keys():
+            if k == "case": continue
+            vals = [r[k] for r in results]
+            out[k] = np.mean(vals)
+        return out
 
-    state_joint = torch.load(args.joint_model, map_location=device)
-    if "model" in state_joint: state_joint = state_joint["model"]
-    model_joint.load_state_dict(state_joint)
+    avg_base = avg_std(base_results)
+    avg_joint = avg_std(joint_results)
 
-    print("[Eval] Evaluating Source-only model...")
-    agg_src, per_volume_src, conf_src = evaluate_model_volume(model_src, dataset, device, args.n_classes, vis_dir=args.vis_dir)
-    print("[Eval] Evaluating Joint-adapted model...")
-    agg_joint, per_volume_joint, conf_joint = evaluate_model_volume(model_joint, dataset, device, args.n_classes, vis_dir=args.vis_dir)
-
-    DGRR = (agg_joint["dice"] - agg_src["dice"]) / (1 - agg_src["dice"] + EPS)
-
-    # Save CSV
-    def save_csv(metrics_dict, path):
-        keys = ["file","dice","iou","precision","recall","vol_diff","conf_mean","conf_ratio"]
-        with open(path,"w",newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=keys)
-            writer.writeheader()
-            for fname, m in metrics_dict.items():
-                row = {"file": fname}
-                row.update(m)
-                writer.writerow(row)
-
-    save_csv(per_volume_src, os.path.join(args.result_dir,"eval_source.csv"))
-    save_csv(per_volume_joint, os.path.join(args.result_dir,"eval_joint.csv"))
-
-    # Save summary
-    summary_file = os.path.join(args.result_dir,"eval_summary.txt")
-    with open(summary_file,"w") as f:
+    summary_txt = os.path.join(results_dir, "summary.txt")
+    with open(summary_txt, "w") as f:
         f.write("==== Evaluation Summary ====\n")
-        f.write(f"Source-only Dice: {agg_src['dice']:.4f}\n")
-        f.write(f"Joint-adapted Dice: {agg_joint['dice']:.4f}\n")
-        f.write(f"DGRR: {DGRR:.4f}\n")
-        for k in ["dice","iou","precision","recall","vol_diff","conf_mean","conf_ratio"]:
-            f.write(f"{k:<12} src={agg_src[k]:.4f}, joint={agg_joint[k]:.4f}\n")
+        f.write(f"Source-only Dice: {avg_base['dice_cls1']:.4f}\n")
+        f.write(f"Joint-adapted Dice: {avg_joint['dice_cls1']:.4f}\n")
+        f.write(f"DGRR: {avg_joint['dice_cls1']-avg_base['dice_cls1']:.4f}\n\n")
+        for k in avg_base.keys():
+            base = avg_base[k]; joint = avg_joint[k]
+            f.write(f"{k:<12} src={base:.4f}, joint={joint:.4f}\n")
         f.write("============================\n")
-    print(f"[Eval] Done. Summary saved to {summary_file}")
-    print("DGRR =", DGRR)
+
+    plot_boxplot(base_results, joint_results, results_dir)
+    plot_radar(avg_base, avg_joint, results_dir)
+
+    print("[Eval] ✅ All evaluation finished and visualizations saved!")
 
 if __name__ == "__main__":
     main()
